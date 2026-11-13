@@ -146,6 +146,7 @@ typedef struct xfs_sb {
 #define XFS_AGFL_MAGIC                      0x5841464c  /* 'XAFL' */
 #define XFS_AGF_VERSION                     1
 #define XFS_AGI_VERSION                     1
+#define XFS_AGFL_VERSION                    1
 
 /*
  * Btree number 0 is bno, 1 is cnt, 2 is rmap. This value gives the size of the
@@ -196,6 +197,19 @@ typedef struct xfs_agf {
 
     /* structure must be padded to 64 bit alignment */
 } xfs_agf_t;
+
+/*
+ * The AGFL header only exists on v5 (CRC enabled) filesystems. On older
+ * filesystems the first sector of the AGFL block is unused.
+ */
+typedef struct xfs_agfl {
+    uint32_t        agfl_magicnum;                      /* magic number == XFS_AGFL_MAGIC */
+    uint32_t        agfl_seqno;                         /* allocation group number */
+    char            agfl_uuid[16];                      /* uuid of filesystem */
+    uint64_t        agfl_lsn;                           /* last write sequence */
+    uint32_t        agfl_crc;                           /* crc of agfl sector */
+    uint32_t        agfl_pad;
+} xfs_agfl_t;
 
 #define XFS_AGF_MAGICNUM                    (1 << 0)
 #define XFS_AGF_VERSIONNUM                  (1 << 1)
@@ -535,6 +549,10 @@ typedef struct xfs_alloc_rec {
 #define XFS_FIBT_MAGIC                      0x46494254  /* 'FIBT' */
 #define XFS_FIBT_CRC_MAGIC                  0x46494233  /* 'FIB3' */
 
+/* Reverse mapping and reference count btrees use the long block format */
+#define XFS_RMAP_CRC_MAGIC                  0x524d4233  /* 'RMB3' */
+#define XFS_REFC_CRC_MAGIC                  0x52334643  /* 'R3FC' */
+
 /*
  * The on-disk inode record structure has two formats. The original "full"
  * format uses a 4-byte freecount. The "sparse" format uses a 1-byte freecount
@@ -584,6 +602,13 @@ struct xfs_bmdr_block {
  * that flag.
  */
 /* DISSECT: some of these structures are optimized. */
+/*
+ * The CRC headers mirror the on-disk byte order. Note that the long and short
+ * forms do not order their identification fields identically:
+ *   - short form: bb_blkno, bb_lsn, bb_uuid
+ *   - long form : bb_blkno, bb_uuid, bb_lsn
+ * bb_blkno is a disk address in 512 byte sectors (daddr), not a filesystem block.
+ */
 /* short form block header */
 struct xfs_btree_sblock {
     uint32_t        bb_magic;                           /* magic number for block type */
@@ -621,8 +646,8 @@ struct xfs_btree_lblock_crc {
     uint64_t        bb_leftsib;
     uint64_t        bb_rightsib;
     uint64_t        bb_blkno;
-    uint64_t        bb_lsn;
     char            bb_uuid[16];
+    uint64_t        bb_lsn;
     uint64_t        bb_owner;
     uint32_t        bb_crc;
     uint32_t        bb_pad;
