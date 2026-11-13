@@ -888,6 +888,144 @@ typedef struct xfs_dir2_block_tail {
     uint32_t        count;                              /* count of leaf entries */
     uint32_t        stale;                              /* count of stale lf entries */
 } xfs_dir2_block_tail_t;
+
+/*
+ * Extended attribute format definitions.
+ *
+ * Attributes can be stored in the shortform format (inside the inode), the
+ * leaf format (one or more blocks referenced from the inode) or the node
+ * format (a B+tree of leaf blocks for very large attribute sets). Attribute
+ * values can either be stored inline in the leaf block or in a remote block,
+ * referenced by the value block number in the leaf entry.
+ *
+ * The on-disk structures are derived from fs/xfs/libxfs/xfs_da_format.h and
+ * fs/xfs/libxfs/xfs_attr_leaf.h in the Linux kernel.
+ */
+#define XFS_ATTR_LEAF_MAPSIZE              3           /* free space map entries in a leaf header */
+
+#define XFS_ATTR_LEAF_MAGIC                 0xFBEE      /* v2 attr leaf block */
+#define XFS_DA_NODE_MAGIC                   0xFEBE      /* v2 non-leaf block */
+#define XFS_ATTR3_LEAF_MAGIC                0x58414642  /* 'XAFB': v3 attr leaf block */
+#define XFS_DA3_NODE_MAGIC                  0x58444644  /* 'XDFD': v3 non-leaf block */
+#define XFS_ATTR3_RMT_MAGIC                 0x58414633  /* 'XAF3': v3 remote value block */
+
+/*
+ * Attribute flags. The namespace is encoded in the on-disk flag bits: an
+ * attribute without a namespace bit lives in the user namespace.
+ */
+#define XFS_ATTR_LOCAL                      0x0001      /* value is stored in the leaf, not remote */
+#define XFS_ATTR_ROOT                       0x0002      /* trusted namespace */
+#define XFS_ATTR_SECURE                     0x0004      /* security namespace */
+#define XFS_ATTR_INCOMPLETE                 0x0080      /* attribute is in the middle of an update */
+
+/*
+ * Shortform attribute structures. The whole attribute list lives in the
+ * inode's attribute fork. Entries are packed directly after the header.
+ */
+struct xfs_attr_sf_hdr {
+    uint16_t        totsize;                            /* total size of the attribute fork, including header */
+    uint8_t         count;                              /* number of entries */
+    uint8_t         i8count;                            /* unused for attributes */
+};
+
+struct xfs_attr_sf_entry {
+    uint8_t         namelen;                            /* name length, not null terminated */
+    uint8_t         valuelen;                           /* value length */
+    uint8_t         flags;                              /* attribute flags */
+};
+
+/*
+ * Block information headers. v2 blocks only carry a magic number and padding,
+ * while v3 (CRC enabled) blocks carry the full verification trailer.
+ */
+struct xfs_da_blkinfo {
+    uint16_t        magic;
+    uint16_t        pad;
+};
+
+struct xfs_da3_blkinfo {
+    uint32_t        magic;                              /* magic number */
+    uint32_t        crc;                                /* CRC of the block */
+    uint64_t        blkno;                              /* first block of the buffer */
+    uint64_t        lsn;                                /* sequence number of the last write */
+    char            uuid[16];                           /* filesystem we belong to */
+    uint64_t        owner;                              /* inode that owns the block */
+    uint32_t        pad;
+};
+
+struct xfs_attr_leaf_map {
+    uint16_t        base;                               /* start offset in block */
+    uint16_t        size;                               /* number of bytes */
+};
+
+/*
+ * Leaf header as stored after the block information header. The fixed size
+ * leaf entry array follows immediately afterwards.
+ */
+struct xfs_attr_leaf_hdr {
+    xfs_attr_leaf_map freemap[XFS_ATTR_LEAF_MAPSIZE];   /* free space descriptors */
+    uint16_t        count;                              /* number of leaf entries */
+    uint16_t        usedbytes;                          /* bytes used by names and values */
+    uint16_t        firstused;                          /* first used byte in block */
+    uint8_t         holes;                              /* !=0 if leaf has holes */
+    uint8_t         pad1;
+    xfs_attr_leaf_map padx;                             /* unused */
+    uint16_t        pad2;                               /* unused */
+};
+
+struct xfs_attr_leaf_entry {
+    uint32_t        hashval;                            /* hash of the name */
+    uint16_t        nameidx;                            /* index into the name/value area */
+    uint8_t         flags;                              /* attribute flags */
+    uint8_t         pad2;
+};
+
+struct xfs_attr_leaf_name_local {
+    uint16_t        valuelen;                           /* value length */
+    uint8_t         namelen;                            /* name length */
+};
+
+struct xfs_attr_leaf_name_remote {
+    uint32_t        valueblk;                           /* starting block of the value */
+    uint16_t        valuelen;                           /* value length */
+    uint8_t         namelen;                            /* name length */
+};
+
+/*
+ * Node (non-leaf) B+tree block, used once the attribute tree grows beyond a
+ * single leaf block. The child block numbers are relative to the allocation
+ * group of the owning inode.
+ */
+struct xfs_da_node_hdr {
+    uint16_t        count;                              /* number of node entries */
+    uint16_t        level;                              /* level in the tree */
+};
+
+struct xfs_da_node_entry {
+    uint32_t        hashval;                            /* hash of the name */
+    uint32_t        before;                             /* child block number, AG relative */
+};
+
+/*
+ * Header for a remote attribute value. Large values are split over one or
+ * more filesystem blocks, each prefixed by this header. v2 filesystems only
+ * store the offset and length, v3 filesystems add a magic number and CRC.
+ */
+struct xfs_attr_rmt_hdr {
+    uint32_t        rm_offset;                          /* offset of this block in the value */
+    uint32_t        rm_bytes;                           /* number of value bytes in this block */
+};
+
+struct xfs_attr3_rmt_hdr {
+    uint32_t        rm_magic;                           /* XFS_ATTR3_RMT_MAGIC */
+    uint32_t        rm_offset;                          /* offset of this block in the value */
+    uint32_t        rm_bytes;                           /* number of value bytes in this block */
+    uint32_t        rm_crc;                             /* CRC of the block */
+    char            rm_uuid[16];                        /* UUID of the filesystem */
+    uint64_t        rm_owner;                           /* inode that owns the block */
+    uint64_t        rm_blkno;                           /* block number of this block */
+    uint64_t        rm_lsn;                             /* sequence number of the last write */
+};
 """
 
 c_xfs = cstruct(endian=">").load(xfs_def)

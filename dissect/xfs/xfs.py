@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import io
 import logging
 import os
@@ -476,6 +477,217 @@ class INode:
         return RangeStream(self._buf, offset, size)
 
     @cached_property
+    def xattr(self) -> list[XAttr]:
+        """The complete set of valid extended attributes of this inode."""
+        return list(self.iter_xattr())
+
+    @property
+    def attributes(self) -> list[XAttr]:
+        """Alias for :attr:`xattr`."""
+        return self.xattr
+
+    def iter_xattr(self) -> Iterator[XAttr]:
+        """Iterate over the valid extended attributes of this inode.
+
+        Supports the shortform format stored in the inode, the leaf and node
+        formats stored in blocks, and both inline and remote values. Attributes
+        that are in the middle of an update (the incomplete flag) or whose
+        values cannot be read completely are skipped, so they can never be
+        exported as a valid label.
+        """
+        if self.inode.di_forkoff == 0:
+            return
+
+        aformat = c_xfs.xfs_dinode_fmt(self.inode.di_aformat)
+        if aformat == c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_LOCAL:
+            yield from self._iter_xattr_shortform()
+        elif aformat in (
+            c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_EXTENTS,
+            c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_BTREE,
+        ):
+            yield from self._iter_xattr_blocks()
+        else:
+            raise Error(f"{self!r} has an unsupported attribute fork format: {aformat}")
+
+    def _iter_xattr_shortform(self) -> Iterator[XAttr]:
+        fork = self.attrfork()
+        data = fork.read()
+
+        if len(data) < len(c_xfs.xfs_attr_sf_hdr):
+            return
+
+        header = c_xfs.xfs_attr_sf_hdr(io.BytesIO(data))
+        end = min(header.totsize, len(data))
+        if end < len(c_xfs.xfs_attr_sf_hdr):
+            return
+
+        offset = len(c_xfs.xfs_attr_sf_hdr)
+        for _ in range(header.count):
+            if offset + len(c_xfs.xfs_attr_sf_entry) > end:
+                break
+
+            entry = c_xfs.xfs_attr_sf_entry(io.BytesIO(data[offset:]))
+            name_start = offset + len(c_xfs.xfs_attr_sf_entry)
+            value_start = name_start + entry.namelen
+            value_end = value_start + entry.valuelen
+
+            if entry.namelen == 0 or value_end > end:
+                break
+
+            name = data[name_start:value_start]
+            value = data[value_start:value_end]
+            offset = value_end
+
+            if entry.flags & c_xfs.XFS_ATTR_INCOMPLETE:
+                continue
+
+            yield XAttr(self, name, value, entry.flags, XAttrSource.INODE)
+
+    def _iter_xattr_blocks(self) -> Iterator[XAttr]:
+        aformat = c_xfs.xfs_dinode_fmt(self.inode.di_aformat)
+
+        if aformat == c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_EXTENTS:
+            fork = self.attrfork()
+            fork.seek(0)
+            extents = fork.read(self.attr_extents * 16)
+
+            for extent_num in range(self.attr_extents):
+                _, block, count, _ = parse_fsblock(extents[extent_num * 16 : (extent_num + 1) * 16])
+                for leaf_block in range(count):
+                    yield from self._iter_xattr_da_block(self._agblock_to_fsblock(block + leaf_block))
+        else:
+            fork = self.attrfork()
+            fork.seek(0)
+            root = c_xfs.xfs_bmdr_block(fork)
+
+            maxrecs = (fork.size - len(c_xfs.xfs_bmdr_block)) // 16
+            fork.seek(len(c_xfs.xfs_bmdr_block) + maxrecs * 8)
+            ptrs = c_xfs.uint64[root.bb_numrecs](fork)
+
+            for ptr in ptrs:
+                yield from self._iter_xattr_da_block(ptr)
+
+    def _iter_xattr_da_block(self, fsblock: int) -> Iterator[XAttr]:
+        block = self._read_fsblock(fsblock)
+        if not block:
+            return
+
+        magic = int.from_bytes(block[:4], "big")
+        if magic in (int(c_xfs.XFS_ATTR3_LEAF_MAGIC), int(c_xfs.XFS_ATTR_LEAF_MAGIC)):
+            yield from self._iter_xattr_leaf_block(block)
+        elif magic in (int(c_xfs.XFS_DA3_NODE_MAGIC), int(c_xfs.XFS_DA_NODE_MAGIC)):
+            yield from self._iter_xattr_node_block(block)
+
+    def _iter_xattr_leaf_block(self, block: bytes) -> Iterator[XAttr]:
+        info_size = len(c_xfs.xfs_da3_blkinfo) if self.xfs._has_crc else len(c_xfs.xfs_da_blkinfo)
+        if len(block) < info_size + len(c_xfs.xfs_attr_leaf_hdr):
+            return
+
+        header = c_xfs.xfs_attr_leaf_hdr(io.BytesIO(block[info_size:]))
+        entries_start = info_size + len(c_xfs.xfs_attr_leaf_hdr)
+
+        for entry_num in range(header.count):
+            entry_offset = entries_start + entry_num * len(c_xfs.xfs_attr_leaf_entry)
+            if entry_offset + len(c_xfs.xfs_attr_leaf_entry) > len(block):
+                break
+
+            entry = c_xfs.xfs_attr_leaf_entry(io.BytesIO(block[entry_offset:]))
+            name_idx = entry.nameidx
+
+            if entry.flags & c_xfs.XFS_ATTR_INCOMPLETE or name_idx >= len(block):
+                continue
+
+            if entry.flags & c_xfs.XFS_ATTR_LOCAL:
+                name = c_xfs.xfs_attr_leaf_name_local(io.BytesIO(block[name_idx:]))
+                name_start = name_idx + len(c_xfs.xfs_attr_leaf_name_local)
+                value_start = name_start + name.namelen
+                value_end = value_start + name.valuelen
+
+                if name.namelen == 0 or value_end > len(block):
+                    continue
+
+                attr_name = block[name_start:value_start]
+                value = block[value_start:value_end]
+
+                yield XAttr(self, attr_name, value, entry.flags, XAttrSource.LEAF)
+            else:
+                name = c_xfs.xfs_attr_leaf_name_remote(io.BytesIO(block[name_idx:]))
+                name_start = name_idx + len(c_xfs.xfs_attr_leaf_name_remote)
+                name_end = name_start + name.namelen
+
+                if name.namelen == 0 or name_end > len(block):
+                    continue
+
+                attr_name = block[name_start:name_end]
+                value = self._read_remote_value(name.valueblk, name.valuelen)
+                if value is None:
+                    continue
+
+                yield XAttr(self, attr_name, value, entry.flags, XAttrSource.REMOTE)
+
+    def _iter_xattr_node_block(self, block: bytes) -> Iterator[XAttr]:
+        info_size = len(c_xfs.xfs_da3_blkinfo) if self.xfs._has_crc else len(c_xfs.xfs_da_blkinfo)
+        if len(block) < info_size + len(c_xfs.xfs_da_node_hdr):
+            return
+
+        header = c_xfs.xfs_da_node_hdr(io.BytesIO(block[info_size:]))
+        entries_start = info_size + len(c_xfs.xfs_da_node_hdr)
+
+        for entry_num in range(header.count):
+            entry_offset = entries_start + entry_num * len(c_xfs.xfs_da_node_entry)
+            if entry_offset + len(c_xfs.xfs_da_node_entry) > len(block):
+                break
+
+            entry = c_xfs.xfs_da_node_entry(io.BytesIO(block[entry_offset:]))
+            yield from self._iter_xattr_da_block(self._agblock_to_fsblock(entry.before))
+
+    def _read_remote_value(self, value_block: int, value_length: int) -> bytes | None:
+        block_size = self.xfs.block_size
+        header_size = len(c_xfs.xfs_attr3_rmt_hdr) if self.xfs._has_crc else len(c_xfs.xfs_attr_rmt_hdr)
+        payload_capacity = block_size - header_size
+        blocks = (value_length + payload_capacity - 1) // payload_capacity
+        parts = []
+        remaining = value_length
+
+        for block_num in range(blocks):
+            fsblock = self._agblock_to_fsblock(value_block) + block_num
+            block = self._read_fsblock(fsblock)
+            if len(block) < block_size:
+                return None
+
+            if self.xfs._has_crc:
+                header = c_xfs.xfs_attr3_rmt_hdr(io.BytesIO(block))
+                if header.rm_magic != c_xfs.XFS_ATTR3_RMT_MAGIC or header.rm_offset != block_num * block_size:
+                    return None
+                data_length = header.rm_bytes
+            else:
+                header = c_xfs.xfs_attr_rmt_hdr(io.BytesIO(block))
+                data_length = header.rm_bytes
+
+            if header_size + data_length > block_size:
+                return None
+
+            chunk = block[header_size : header_size + data_length]
+            if data_length > remaining:
+                return None
+
+            parts.append(chunk)
+            remaining -= data_length
+
+        value = b"".join(parts)
+        if remaining != 0 or len(value) < value_length:
+            return None
+
+        return value[:value_length]
+
+    def _agblock_to_fsblock(self, agblock: int) -> int:
+        return self.ag.num * self.xfs.sb.sb_agblocks + agblock
+
+    def _read_fsblock(self, fsblock: int) -> bytes:
+        self.xfs.fh.seek(fsblock * self.xfs.block_size)
+        return self.xfs.fh.read(self.xfs.block_size)
+
+    @cached_property
     def dataruns(self) -> list[tuple[int | None, int]]:
         runs = []
         run_offset = 0
@@ -529,6 +741,51 @@ class INode:
             raise UnsupportedDataforkException(f"{self!r} is a character/block device.")
         dinode_type = c_xfs.xfs_dinode_fmt(self.inode.di_format)
         raise UnsupportedDataforkException(f"{self!r} is an unsupported datafork: {dinode_type}")
+
+
+class XAttrSource(enum.Enum):
+    """Where the bytes of an extended attribute are stored on disk."""
+
+    INODE = "inode"
+    LEAF = "leaf"
+    REMOTE = "remote"
+
+
+class XAttr:
+    """A read-only extended attribute.
+
+    Args:
+        inode: The inode that owns the attribute.
+        name: The raw attribute name, without the namespace prefix.
+        value: The complete attribute value.
+        flags: The on-disk attribute flags.
+        source: The storage location of the value.
+    """
+
+    def __init__(self, inode: INode, name: bytes, value: bytes, flags: int, source: XAttrSource) -> None:
+        self.inode = inode
+        self.name = name
+        self.value = value
+        self.flags = flags
+        self.source = source
+
+    @property
+    def namespace(self) -> str:
+        if self.flags & c_xfs.XFS_ATTR_SECURE:
+            return "security"
+        if self.flags & c_xfs.XFS_ATTR_ROOT:
+            return "trusted"
+        return "user"
+
+    @property
+    def full_name(self) -> str:
+        name = self.name.decode(errors="surrogateescape")
+        if self.namespace == "user":
+            return name
+        return f"{self.namespace}.{name}"
+
+    def __repr__(self) -> str:
+        return f"<xattr name={self.full_name} value={self.value!r} source={self.source.value} inode={self.inode}>"
 
 
 def parse_fsblock(s: bytes) -> tuple[int, int, int, int]:
