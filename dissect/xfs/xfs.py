@@ -477,21 +477,46 @@ class INode:
 
     @cached_property
     def dataruns(self) -> list[tuple[int | None, int]]:
+        """Logical block runs of this inode's data fork.
+
+        This is the logical file view: unwritten extents (preallocated, but never
+        written to) are returned as sparse (zero-filled) runs, matching what the
+        filesystem would return when reading the file. Use :attr:`raw_dataruns`
+        to inspect the physical blocks backing unwritten extents.
+        """
+        return self._dataruns()
+
+    @cached_property
+    def raw_dataruns(self) -> list[tuple[int | None, int]]:
+        """Physical block runs of this inode's data fork.
+
+        Unlike :attr:`dataruns`, unwritten extents are mapped to their physical
+        blocks, which may expose stale disk bytes that were never logically
+        written to the file. Only true holes (sparse regions) are zero-filled.
+        """
+        return self._dataruns(raw=True)
+
+    def _dataruns(self, raw: bool = False) -> list[tuple[int | None, int]]:
         runs = []
         run_offset = 0
         expected_runs = (self.size + self.xfs.block_size - 1) // self.xfs.block_size
 
-        for offset, block, count, _ in self._iter_blocks():
+        for offset, block, count, flag in self._iter_blocks():
             if offset != run_offset:
                 gap = offset - run_offset
                 runs.append((None, gap))
                 run_offset += gap
 
-            # Convert filesystem blocks to logical blocks
-            agnum, blknum = fsb_to_bb(block, self.ag.sb.sb_agblklog)
-            block = agnum * self.xfs.sb.sb_agblocks + blknum
+            if not raw and flag & c_xfs.XFS_EXT_UNWRITTEN:
+                # Unwritten extents logically read as zeroes
+                runs.append((None, count))
+            else:
+                # Convert filesystem blocks to logical blocks
+                agnum, blknum = fsb_to_bb(block, self.ag.sb.sb_agblklog)
+                block = agnum * self.xfs.sb.sb_agblocks + blknum
 
-            runs.append((block, count))
+                runs.append((block, count))
+
             run_offset += count
 
         if run_offset < expected_runs:
@@ -518,6 +543,13 @@ class INode:
                 yield from self.ag.walk_extents(ptr)
 
     def open(self) -> BinaryIO:
+        """Open the logical data stream of this inode.
+
+        This is the default file view and the only view that should be used for
+        purposes like hashing: unwritten extents read as zeroes and never expose
+        stale disk bytes. Use :meth:`open_raw` to explicitly inspect the physical
+        blocks backing unwritten extents.
+        """
         if self.inode.di_format == c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_LOCAL:
             return self.datafork()
         if self.inode.di_format in (
@@ -529,6 +561,21 @@ class INode:
             raise UnsupportedDataforkException(f"{self!r} is a character/block device.")
         dinode_type = c_xfs.xfs_dinode_fmt(self.inode.di_format)
         raise UnsupportedDataforkException(f"{self!r} is an unsupported datafork: {dinode_type}")
+
+    def open_raw(self) -> BinaryIO:
+        """Open the physical data stream of this inode.
+
+        Unlike :meth:`open`, unwritten extents are mapped to their physical
+        blocks, exposing stale (never logically written) disk bytes for forensic
+        inspection. For datafork formats without extents this falls back to
+        :meth:`open`.
+        """
+        if self.inode.di_format in (
+            c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_EXTENTS,
+            c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_BTREE,
+        ):
+            return RunlistStream(self.xfs.fh, self.raw_dataruns, self.size, self.xfs.block_size)
+        return self.open()
 
 
 def parse_fsblock(s: bytes) -> tuple[int, int, int, int]:

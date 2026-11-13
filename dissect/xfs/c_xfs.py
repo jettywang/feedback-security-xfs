@@ -561,6 +561,9 @@ struct xfs_inobt_rec {
 #define XFS_BMAP_MAGIC                      0x424d4150  /* 'BMAP' */
 #define XFS_BMAP_CRC_MAGIC                  0x424d4133  /* 'BMA3' */
 
+/* Flag bit of a bmap extent record: the extent is preallocated but unwritten */
+#define XFS_EXT_UNWRITTEN                   0x1
+
 /*
  * Bmap root header, on-disk form only.
  */
