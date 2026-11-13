@@ -4,6 +4,8 @@ import io
 import logging
 import os
 import stat
+from dataclasses import dataclass, field
+from enum import Enum
 from functools import cached_property
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import UUID
@@ -13,6 +15,10 @@ from dissect.util.stream import RangeStream, RunlistStream
 
 from dissect.xfs.c_xfs import FILETYPES, c_xfs
 from dissect.xfs.exceptions import (
+    DirectoryBlockMagicError,
+    DirectoryReadError,
+    DirectoryRecordTruncatedError,
+    DirectoryScanError,
     Error,
     FileNotFoundError,
     NotADirectoryError,
@@ -21,11 +27,118 @@ from dissect.xfs.exceptions import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
     from datetime import datetime
 
 log = logging.getLogger(__name__)
 log.setLevel(os.getenv("DISSECT_LOG_XFS", "CRITICAL"))
+
+
+class ScanState(str, Enum):
+    """Outcome of scanning a single directory block or a whole directory."""
+
+    COMPLETE = "complete"
+    """Every block was read and parsed without errors."""
+
+    PARTIAL = "partial"
+    """At least one block was unreadable or malformed; recovered entries are still yielded."""
+
+    EMPTY = "empty"
+    """The scan completed without errors but the directory produced no entries."""
+
+
+@dataclass
+class DirectoryScanStatus:
+    """Queryable integrity information for a directory scan.
+
+    A status object is attached to every directory inode while it is being scanned through
+    :meth:`INode.iterdir` or :meth:`INode.scan_directory`. Inspect :attr:`complete` (or the
+    convenience :meth:`is_complete` / :meth:`is_empty` helpers) to distinguish a genuinely empty
+    directory from one whose blocks were not fully read.
+
+    Block numbers in the per-block tracking are logical block numbers relative to the start of the
+    directory inode, matching the indexing used by :attr:`INode.dataruns`. Physical filesystem block
+    numbers, when known, are stored on the recovered :class:`INode` entries and in :attr:`errors`.
+    """
+
+    total_blocks: int = 0
+    """Number of directory blocks the inode size says the directory spans."""
+
+    scanned_blocks: int = 0
+    """Number of blocks that were read in full."""
+
+    data_blocks: list[int] = field(default_factory=list)
+    """Logical block numbers holding directory entry data."""
+
+    sparse_blocks: list[int] = field(default_factory=list)
+    """Logical block numbers that are unallocated sparse holes (all zeroes)."""
+
+    index_blocks: list[int] = field(default_factory=list)
+    """Logical block numbers holding leaf/node/free-space index blocks rather than entries."""
+
+    corrupt_blocks: list[int] = field(default_factory=list)
+    """Logical block numbers with an unrecognized (non-benign) magic number."""
+
+    unreadable_blocks: list[int] = field(default_factory=list)
+    """Logical block numbers that could not be read in full."""
+
+    truncated_blocks: list[int] = field(default_factory=list)
+    """Logical block numbers whose entry parsing hit an unexpected end of block."""
+
+    entries_recovered: int = 0
+    """Number of directory entries successfully parsed, including ``.`` and ``..``."""
+
+    errors: list[DirectoryScanError] = field(default_factory=list)
+    """Recoverable errors encountered during the scan."""
+
+    def _record_error(self, error: DirectoryScanError) -> None:
+        self.errors.append(error)
+        block_num = error.block_num
+        if isinstance(error, DirectoryReadError) and block_num not in self.unreadable_blocks:
+            self.unreadable_blocks.append(block_num)
+        elif isinstance(error, DirectoryBlockMagicError) and block_num not in self.corrupt_blocks:
+            self.corrupt_blocks.append(block_num)
+        elif isinstance(error, DirectoryRecordTruncatedError) and block_num not in self.truncated_blocks:
+            self.truncated_blocks.append(block_num)
+
+    @property
+    def complete(self) -> bool:
+        """Whether every directory block was read and parsed without errors."""
+        return not self.errors and self.scanned_blocks == self.total_blocks
+
+    @property
+    def state(self) -> ScanState:
+        """Coarse-grained scan outcome."""
+        if self.errors:
+            return ScanState.PARTIAL
+        if self.entries_recovered == 0:
+            return ScanState.EMPTY
+        return ScanState.COMPLETE
+
+    def is_complete(self) -> bool:
+        """Return whether the scan covered every block without errors."""
+        return self.complete
+
+    def is_empty(self) -> bool:
+        """Return whether an error-free scan yielded no entries."""
+        return self.complete and self.entries_recovered == 0
+
+    @property
+    def affected_blocks(self) -> list[int]:
+        """Logical block numbers involved in any recoverable error, sorted and de-duplicated."""
+        return sorted({error.block_num for error in self.errors if error.block_num >= 0})
+
+
+@dataclass
+class DirectoryScan:
+    """Result of a fully materialized directory scan.
+
+    ``entries`` only contains entries that could be recovered; consult ``status`` to learn whether
+    the scan was complete or blocks were skipped.
+    """
+
+    entries: list[INode]
+    status: DirectoryScanStatus
 
 
 class XFS:
@@ -237,6 +350,8 @@ class INode:
         inum: int,
         filename: str | None = None,
         filetype: int | None = None,
+        dir_logical_block: int | None = None,
+        dir_physical_block: int | None = None,
     ) -> None:
         self.ag = ag
         self.xfs = ag.xfs
@@ -246,6 +361,14 @@ class INode:
 
         self.filename = filename
         self._filetype = filetype
+
+        # Location of the directory entry that produced this inode. ``dir_logical_block`` is the
+        # directory block relative to the parent inode and ``dir_physical_block`` the filesystem
+        # block it was stored in. Both are ``None`` for inodes not recovered from a directory scan.
+        self.dir_logical_block = dir_logical_block
+        self.dir_physical_block = dir_physical_block
+
+        self._dir_scan_status: DirectoryScanStatus | None = None
 
     def __repr__(self) -> str:
         return f"<inode {self.inum} ({self.ag.num}:{self.relative_inum})>"
@@ -354,105 +477,227 @@ class INode:
         return _parse_ts(self.inode.di_crtime, self._has_bigtime())
 
     def listdir(self) -> dict[str, INode]:
+        """Return the recoverable directory entries as a ``{name: inode}`` mapping.
+
+        This is the backwards-compatible entry point: it never raises on damaged directory blocks.
+        Entries that can still be parsed are returned even when the scan is incomplete. Use
+        :attr:`dir_scan_status` after iteration to inspect whether the listing is complete.
+        """
         return {node.filename: node for node in self.iterdir()}
 
     dirlist = listdir
 
+    def scan_directory(self) -> DirectoryScan:
+        """Materialize the directory scan and return both the entries and the integrity status.
+
+        Unlike :meth:`iterdir` this consumes the whole scan eagerly so the returned
+        :class:`DirectoryScanStatus` is final and can be queried directly.
+        """
+        status = DirectoryScanStatus()
+        entries = list(self._iterdir(status))
+        return DirectoryScan(entries, status)
+
+    @property
+    def dir_scan_status(self) -> DirectoryScanStatus | None:
+        """The status of the most recent directory scan, or ``None`` before a scan ran."""
+        return self._dir_scan_status
+
     def iterdir(self) -> Iterator[INode]:
+        """Yield the recoverable entries of this directory.
+
+        Damaged or unreadable blocks are recorded on :attr:`dir_scan_status` instead of aborting the
+        whole scan, so a damaged directory still yields everything that could be recovered. Query the
+        status afterwards to tell a genuinely empty directory apart from an incomplete scan.
+        """
+        status = DirectoryScanStatus()
+        self._dir_scan_status = status
+        yield from self._iterdir(status)
+
+    def _iterdir(self, status: DirectoryScanStatus) -> Iterator[INode]:
         if self.filetype != stat.S_IFDIR:
             raise NotADirectoryError(f"{self!r} is not a directory")
 
-        buf = self.open()
         if self.inode.di_format == c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_LOCAL:
-            header = c_xfs.xfs_dir2_sf_hdr(buf)
-            inum_s = c_xfs.uint64 if header.i8count else c_xfs.uint32
-
-            if header.i8count:
-                header.parent = (header.parent << 32) | c_xfs.uint32(buf)
-
-            yield self.xfs.get_inode(self.inum, filename=".")
-            yield self.xfs.get_inode(header.parent, filename="..")
-
-            for _ in range(header.count):
-                entry = c_xfs.xfs_dir2_sf_entry(buf)
-                fname = entry.name.decode(errors="surrogateescape")
-                ftype = c_xfs.uint8(buf) if self.xfs._has_ftype else 0
-                inum = inum_s(buf)
-
-                ftype = FILETYPES[ftype]
-
-                yield self.xfs.get_inode(inum, fname, ftype)
+            yield from self._iterdir_shortform(status)
         elif self.inode.di_format in (
             c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_EXTENTS,
             c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_BTREE,
         ):
-            for block_num in range(self.size // self.xfs.block_size):
-                buf.seek(block_num * self.xfs.block_size)
-
-                block_data = buf.read(self.xfs.block_size)
-                block = io.BytesIO(block_data)
-
-                block.seek(-len(c_xfs.xfs_dir2_block_tail), io.SEEK_END)
-                tail = c_xfs.xfs_dir2_block_tail(block)
-                block.seek(0)
-
-                if self.data_extents > 1:
-                    entries_end = self.xfs.block_size
-                else:
-                    entries_end = self.xfs.block_size
-                    entries_end -= len(c_xfs.xfs_dir2_block_tail)
-                    entries_end -= len(c_xfs.xfs_dir2_leaf_entry) * tail.count
-
-                if self.xfs.version == 5:
-                    header = c_xfs.xfs_dir3_data_hdr(block)
-                    if header.magic not in (c_xfs.XFS_DIR3_BLOCK_MAGIC, c_xfs.XFS_DIR3_DATA_MAGIC):
-                        # Probably a sparse block
-                        continue
-                else:
-                    header = c_xfs.xfs_dir2_data_hdr(block)
-                    if header.magic not in (c_xfs.XFS_DIR2_BLOCK_MAGIC, c_xfs.XFS_DIR2_DATA_MAGIC):
-                        # Probably a sparse block
-                        continue
-
-                data_entry = c_xfs.xfs_dir2_data_entry_ftype if self.xfs._has_ftype else c_xfs.xfs_dir2_data_entry
-
-                while True:
-                    if block.tell() >= entries_end:
-                        break
-
-                    try:
-                        if block_data[block.tell() : block.tell() + 2] == b"\xff\xff":
-                            unused = c_xfs.xfs_dir2_data_unused(block)
-
-                            block.read(unused.length - 6)
-
-                            misalign = block.tell() % 8
-                            if misalign:
-                                block.seek(8 - misalign, io.SEEK_CUR)
-
-                            continue
-
-                        entry = data_entry(block)
-
-                        # Entries are 8 byte aligned
-                        # uint64 inum | uint8 namelen | variable name | uint8 ftype | uint16 tag
-                        misalign = block.tell() % 8
-                        if misalign:
-                            block.seek(8 - misalign, io.SEEK_CUR)
-                    except EOFError:
-                        break
-
-                    inum = entry.inumber
-                    if inum >> 48 == 0xFFFF:  # XFS_DIR2_DATA_FREE_TAG
-                        break
-
-                    ftype = FILETYPES[entry.ftype] if self.xfs._has_ftype else None
-
-                    fname = entry.name.decode(errors="surrogateescape")
-
-                    yield self.xfs.get_inode(inum, fname, ftype)
+            yield from self._iterdir_blocks(status)
         else:
             raise Error(f"{self!r} has invalid inode format for dirlist")
+
+    def _emit(self, status: DirectoryScanStatus, node: INode) -> INode:
+        status.entries_recovered += 1
+        return node
+
+    def _iterdir_shortform(self, status: DirectoryScanStatus) -> Iterator[INode]:
+        # A shortform directory lives entirely inside the inode, so there are no directory blocks to
+        # read and a completed parse is always complete.
+        status.total_blocks = 0
+        status.scanned_blocks = 0
+
+        buf = self.open()
+        header = c_xfs.xfs_dir2_sf_hdr(buf)
+        inum_s = c_xfs.uint64 if header.i8count else c_xfs.uint32
+
+        if header.i8count:
+            header.parent = (header.parent << 32) | c_xfs.uint32(buf)
+
+        yield self._emit(status, self.xfs.get_inode(self.inum, filename="."))
+        yield self._emit(status, self.xfs.get_inode(header.parent, filename=".."))
+
+        for _ in range(header.count):
+            entry = c_xfs.xfs_dir2_sf_entry(buf)
+            fname = entry.name.decode(errors="surrogateescape")
+            ftype = c_xfs.uint8(buf) if self.xfs._has_ftype else 0
+            inum = inum_s(buf)
+
+            ftype = FILETYPES[ftype]
+
+            yield self._emit(status, self.xfs.get_inode(inum, fname, ftype))
+
+    def _iterdir_blocks(self, status: DirectoryScanStatus) -> Iterator[INode]:
+        buf = self.open()
+        runlist = self.dataruns
+        total_blocks = self.size // self.xfs.block_size
+        status.total_blocks = total_blocks
+
+        for block_num in range(total_blocks):
+            buf.seek(block_num * self.xfs.block_size)
+
+            try:
+                block_data = buf.read(self.xfs.block_size)
+            except OSError as exc:
+                status._record_error(
+                    DirectoryReadError(f"{self!r} directory block {block_num} could not be read: {exc}", block_num)
+                )
+                log.warning("Unable to read directory block %d of %r: %s", block_num, self, exc)
+                continue
+
+            if len(block_data) < self.xfs.block_size:
+                status._record_error(
+                    DirectoryReadError(
+                        f"{self!r} directory block {block_num} short read: "
+                        f"got {len(block_data)} of {self.xfs.block_size} bytes",
+                        block_num,
+                    )
+                )
+                log.warning(
+                    "Short read on directory block %d of %r (%d/%d bytes)",
+                    block_num,
+                    self,
+                    len(block_data),
+                    self.xfs.block_size,
+                )
+                continue
+
+            status.scanned_blocks += 1
+            block = io.BytesIO(block_data)
+            physical_block = self._physical_dir_block(runlist, block_num)
+            magic = int.from_bytes(block_data[:4], "big")
+
+            # Sparse directory blocks are unallocated holes and always read back as zeroes.
+            if magic == 0:
+                status.sparse_blocks.append(block_num)
+                continue
+
+            # Leaf/node and free-space index blocks manage the directory hash index and allocation;
+            # they never contain directory entries and must not be reported as corruption.
+            if magic in _DIR_INDEX_MAGICS:
+                status.index_blocks.append(block_num)
+                continue
+
+            if magic not in _DIR_DATA_MAGICS:
+                status._record_error(
+                    DirectoryBlockMagicError(
+                        f"{self!r} directory block {block_num} has unrecognized magic 0x{magic:x}", block_num
+                    )
+                )
+                log.warning("Invalid magic 0x%x on directory block %d of %r", magic, block_num, self)
+                continue
+
+            status.data_blocks.append(block_num)
+            yield from self._iterdir_data_block(block, block_data, block_num, physical_block, status)
+
+    def _iterdir_data_block(
+        self,
+        block: io.BytesIO,
+        block_data: bytes,
+        block_num: int,
+        physical_block: int | None,
+        status: DirectoryScanStatus,
+    ) -> Iterator[INode]:
+        block.seek(-len(c_xfs.xfs_dir2_block_tail), io.SEEK_END)
+        tail = c_xfs.xfs_dir2_block_tail(block)
+        block.seek(0)
+
+        # Skip past the data header; its magic was already validated against _DIR_DATA_MAGICS.
+        if self.xfs.version == 5:
+            c_xfs.xfs_dir3_data_hdr(block)
+        else:
+            c_xfs.xfs_dir2_data_hdr(block)
+
+        if self.data_extents > 1:
+            entries_end = self.xfs.block_size
+        else:
+            entries_end = self.xfs.block_size
+            entries_end -= len(c_xfs.xfs_dir2_block_tail)
+            entries_end -= len(c_xfs.xfs_dir2_leaf_entry) * tail.count
+
+        data_entry = c_xfs.xfs_dir2_data_entry_ftype if self.xfs._has_ftype else c_xfs.xfs_dir2_data_entry
+
+        while block.tell() < entries_end:
+            try:
+                if block_data[block.tell() : block.tell() + 2] == b"\xff\xff":
+                    unused = c_xfs.xfs_dir2_data_unused(block)
+                    block.read(unused.length - 6)
+
+                    misalign = block.tell() % 8
+                    if misalign:
+                        block.seek(8 - misalign, io.SEEK_CUR)
+
+                    continue
+
+                entry = data_entry(block)
+
+                # Entries are 8 byte aligned
+                # uint64 inum | uint8 namelen | variable name | uint8 ftype | uint16 tag
+                misalign = block.tell() % 8
+                if misalign:
+                    block.seek(8 - misalign, io.SEEK_CUR)
+            except EOFError as exc:
+                status._record_error(
+                    DirectoryRecordTruncatedError(
+                        f"{self!r} directory block {block_num} contains a truncated record", block_num
+                    )
+                )
+                log.warning("Truncated directory record in block %d of %r: %s", block_num, self, exc)
+                return
+
+            inum = entry.inumber
+            if inum >> 48 == 0xFFFF:  # XFS_DIR2_DATA_FREE_TAG
+                return
+
+            ftype = FILETYPES[entry.ftype] if self.xfs._has_ftype else None
+            fname = entry.name.decode(errors="surrogateescape")
+
+            node = self.xfs.get_inode(inum, fname, ftype)
+            node.dir_logical_block = block_num
+            node.dir_physical_block = physical_block
+            yield self._emit(status, node)
+
+    @staticmethod
+    def _physical_dir_block(runlist: Sequence[tuple[int | None, int]], block_num: int) -> int | None:
+        """Resolve a logical directory block to its physical filesystem block, if allocated."""
+        offset = 0
+        for run_block, run_count in runlist:
+            if block_num < offset + run_count:
+                if run_block is None:
+                    return None
+                return run_block + (block_num - offset)
+            offset += run_count
+        return None
 
     def datafork(self) -> BinaryIO:
         offset = 0xB0 if self.inode.di_version == 0x3 else 0x64
@@ -529,6 +774,32 @@ class INode:
             raise UnsupportedDataforkException(f"{self!r} is a character/block device.")
         dinode_type = c_xfs.xfs_dinode_fmt(self.inode.di_format)
         raise UnsupportedDataforkException(f"{self!r} is an unsupported datafork: {dinode_type}")
+
+
+# Magic numbers of blocks that actually carry directory entries.
+_DIR_DATA_MAGICS = frozenset(
+    (
+        c_xfs.XFS_DIR2_BLOCK_MAGIC,
+        c_xfs.XFS_DIR2_DATA_MAGIC,
+        c_xfs.XFS_DIR3_BLOCK_MAGIC,
+        c_xfs.XFS_DIR3_DATA_MAGIC,
+    )
+)
+
+# Benign directory blocks without entries: hash leaf/node blocks and free-space index blocks.
+# These are valid parts of a larger directory and must never be flagged as corruption.
+_DIR_INDEX_MAGICS = frozenset(
+    (
+        c_xfs.XFS_DIR2_FREE_MAGIC,
+        c_xfs.XFS_DIR3_FREE_MAGIC,
+        c_xfs.XFS_DIR2_LEAF1_MAGIC,
+        c_xfs.XFS_DIR2_LEAFN_MAGIC,
+        c_xfs.XFS_DIR3_LEAF1_MAGIC,
+        c_xfs.XFS_DIR3_LEAFN_MAGIC,
+        c_xfs.XFS_DA_NODE_MAGIC,
+        c_xfs.XFS_DA3_NODE_MAGIC,
+    )
+)
 
 
 def parse_fsblock(s: bytes) -> tuple[int, int, int, int]:

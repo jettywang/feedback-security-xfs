@@ -694,6 +694,19 @@ struct xfs_acl {
 #define XFS_DIR3_FREE_MAGIC                 0x58444633  /* XDF3: free index blocks */
 
 /*
+ * Directory leaf and node blocks. Leaf blocks store the hash index of the
+ * directory entries while node blocks are the interior levels of the directory
+ * b+tree. Both the v2 (dir2) and v3 (dir3/CRC) variants exist and are benign
+ * blocks that do not themselves contain directory entries.
+ */
+#define XFS_DIR2_LEAF1_MAGIC                0xd2f1      /* v2 single-block leaf */
+#define XFS_DIR2_LEAFN_MAGIC                0xd2ff      /* v2 multi-block leaf */
+#define XFS_DIR3_LEAF1_MAGIC                0xdf21      /* v3 single-block leaf */
+#define XFS_DIR3_LEAFN_MAGIC                0xdf22      /* v3 multi-block leaf */
+#define XFS_DA_NODE_MAGIC                   0xfebe      /* v2 directory b+tree node */
+#define XFS_DA3_NODE_MAGIC                  0x44414233  /* DAB3: v3 directory b+tree node */
+
+/*
  * Directory layout when stored internal to an inode.
  *
  * Small directories are packed as tightly as possible so as to fit into the
