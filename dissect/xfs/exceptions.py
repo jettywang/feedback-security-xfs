@@ -27,3 +27,12 @@ class NotASymlinkError(Error):
 
 class SymlinkUnavailableException(Error):
     pass
+
+
+class DirectoryIndexError(Error):
+    """Raised when a directory index (leaf/node) block cannot be trusted.
+
+    Signals that the hash-indexed lookup could not produce an authoritative
+    answer. Callers must fall back to a linear scan of the directory data
+    blocks instead of concluding that a name is absent.
+    """

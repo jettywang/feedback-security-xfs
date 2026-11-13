@@ -694,6 +694,34 @@ struct xfs_acl {
 #define XFS_DIR3_FREE_MAGIC                 0x58444633  /* XDF3: free index blocks */
 
 /*
+ * Leaf and node blocks of the directory index (the hash-indexed btree).
+ * LEAF1 is the leaf of a block-format directory or a leaf-only multiblock
+ * directory, LEAFN is a leaf block underneath a node btree.
+ *
+ * Version 2 leaf/node blocks embed an xfs_da_blkinfo whose magic is 16 bit,
+ * hence the 0x5844.. short constants. The CRC-enabled v3 blocks use the full
+ * 32 bit magic from xfs_da3_blkinfo.
+ */
+#define XFS_DIR2_LEAF1_MAGIC                0x424c      /* 'BL': leaf, bests present */
+#define XFS_DIR2_LEAFN_MAGIC                0x4c4e      /* 'LN': leaf, no bests */
+#define XFS_DIR3_LEAF1_MAGIC                0x58444c33  /* XDL3: v3 leaf, bests present */
+#define XFS_DIR3_LEAFN_MAGIC                0x58444c4e  /* XDN3: v3 leaf, no bests */
+
+#define XFS_DIR2_NODE_MAGIC                 0x424e      /* 'BN': dir node btree block */
+#define XFS_DIR3_NODE_MAGIC                 0x58444e33  /* XDN3: v3 dir node btree block */
+
+/*
+ * Directory free space block (freeindex). The block starts with the same data
+ * header as a data block (xfs_dir2_data_hdr / xfs_dir3_data_hdr, which already
+ * carries the magic); this structure is what follows it.
+ */
+typedef struct xfs_dir2_free_hdr {
+    uint32_t        firstdb;                            /* first data block number */
+    uint32_t        nvalid;                             /* count of valid bestfree entries */
+    uint32_t        nused;                              /* count of used bestfree entries */
+} xfs_dir2_free_hdr_t;
+
+/*
  * Directory layout when stored internal to an inode.
  *
  * Small directories are packed as tightly as possible so as to fit into the
@@ -888,6 +916,67 @@ typedef struct xfs_dir2_block_tail {
     uint32_t        count;                              /* count of leaf entries */
     uint32_t        stale;                              /* count of stale lf entries */
 } xfs_dir2_block_tail_t;
+
+/*
+ * Leaf block headers (xfs_dir2_leaf_hdr). The v2 header embeds a
+ * xfs_da_blkinfo, the CRC-enabled v3 header an xfs_da3_blkinfo. The v2
+ * blockinfo stores a 16 bit magic, a 16 bit pad and a 32 bit block number.
+ */
+typedef struct xfs_dir2_leaf_hdr {
+    uint16_t        magic;
+    uint16_t        pad;
+    uint32_t        blkno;                              /* first block of the buffer */
+    uint32_t        lsn;
+    uint64_t        forwards;                           /* first leaf block */
+    uint64_t        backwards;                          /* last leaf block */
+    uint16_t        count;                              /* count of leaf entries incl. stale */
+    uint16_t        stale;                              /* count of stale entries */
+} xfs_dir2_leaf_hdr_t;
+
+typedef struct xfs_dir3_leaf_hdr {
+    /* DISSECT: unfolded xfs_da3_blkinfo */
+    uint32_t        magic;
+    uint32_t        crc;
+    uint64_t        blkno;
+    uint64_t        lsn;
+    char            uuid[16];
+    uint64_t        owner;
+    uint64_t        forwards;
+    uint64_t        backwards;
+    uint16_t        count;
+    uint16_t        stale;
+    uint16_t        pad;
+} xfs_dir3_leaf_hdr_t;
+
+/*
+ * Node block headers (xfs_da_node_hdr / xfs_da3_node_hdr). Same layout as
+ * the leaf headers with the entry count replaced by the btree level.
+ */
+typedef struct xfs_da_node_hdr {
+    uint16_t        magic;
+    uint16_t        pad;
+    uint32_t        blkno;
+    uint32_t        lsn;
+    uint64_t        forwards;
+    uint64_t        backwards;
+    uint16_t        level;                              /* 0 is a leaf */
+    uint16_t        count;                              /* count of node entries */
+} xfs_da_node_hdr_t;
+
+typedef struct xfs_da3_node_hdr {
+    /* DISSECT: unfolded xfs_da3_blkinfo */
+    uint32_t        magic;
+    uint32_t        crc;
+    uint64_t        blkno;
+    uint64_t        lsn;
+    char            uuid[16];
+    uint64_t        owner;
+    uint64_t        forwards;
+    uint64_t        backwards;
+    uint16_t        level;
+    uint16_t        count;
+    uint16_t        pad;
+} xfs_da3_node_hdr_t;
 """
 
 c_xfs = cstruct(endian=">").load(xfs_def)

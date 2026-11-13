@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import stat
+import struct
 from functools import cached_property
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import UUID
@@ -13,6 +14,7 @@ from dissect.util.stream import RangeStream, RunlistStream
 
 from dissect.xfs.c_xfs import FILETYPES, c_xfs
 from dissect.xfs.exceptions import (
+    DirectoryIndexError,
     Error,
     FileNotFoundError,
     NotADirectoryError,
@@ -55,6 +57,16 @@ class XFS:
         self.uuid = UUID(bytes=self.sb.sb_uuid)
         self.meta_uuid = UUID(bytes=self.sb.sb_meta_uuid)
 
+        # Observability counters for name lookups. ``index_*`` only count
+        # block-format directories; shortform directories use ``shortform``.
+        self.lookup_stats = {
+            "shortform": 0,
+            "index_hit": 0,
+            "index_miss": 0,
+            "index_fallback": 0,
+            "linear": 0,
+        }
+
         self.root = self.get_inode(self.sb.sb_rootino)
 
     def get(self, path: int | str, node: INode | None = None) -> INode:
@@ -68,11 +80,8 @@ class XFS:
             if not part:
                 continue
 
-            for entry in node.iterdir():
-                if entry.filename == part:
-                    node = entry
-                    break
-            else:
+            node = node.get_child(part)
+            if node is None:
                 raise FileNotFoundError(f"File not found: {path}")
 
         return node
@@ -358,6 +367,89 @@ class INode:
 
     dirlist = listdir
 
+    def get_child(self, name: str) -> INode | None:
+        """Look up a single directory entry by name.
+
+        Shortform (inline) directories are small enough to be read in full, so
+        they keep using the linear traversal. Block-format directories use the
+        hash-indexed leaf/node btree to touch only the relevant data blocks.
+
+        The index is treated strictly as a hint: any corruption, stale entry
+        or unsupported layout triggers a linear fallback scan, so an index
+        problem can never produce a false "file does not exist" conclusion.
+        Matching is always performed on the raw name bytes, never on the hash.
+        """
+        if self.filetype != stat.S_IFDIR:
+            raise NotADirectoryError(f"{self!r} is not a directory")
+
+        if self.inode.di_format == c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_LOCAL:
+            self.xfs.lookup_stats["shortform"] += 1
+            for entry in self.iterdir():
+                if entry.filename == name:
+                    return entry
+            return None
+
+        if self.inode.di_format not in (
+            c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_EXTENTS,
+            c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_BTREE,
+        ):
+            raise Error(f"{self!r} has invalid inode format for dirlist")
+
+        try:
+            return self._indexed_lookup(name)
+        except DirectoryIndexError as err:
+            log.warning("Directory index lookup failed for %r, falling back to linear scan: %s", self, err)
+            self.xfs.lookup_stats["index_fallback"] += 1
+            return self._linear_lookup(name)
+
+    def _linear_lookup(self, name: str) -> INode | None:
+        self.xfs.lookup_stats["linear"] += 1
+        for entry in self.iterdir():
+            if entry.filename == name:
+                return entry
+        return None
+
+    def _indexed_lookup(self, name: str) -> INode | None:
+        # Only the common directory block size equal to the filesystem block
+        # size is handled by the index; dirblklog != 0 degrades to a scan.
+        if self.xfs.sb.sb_dirblklog != 0:
+            raise DirectoryIndexError(f"non-zero sb_dirblklog ({self.xfs.sb.sb_dirblklog}) is not indexable")
+
+        if self.size < self.xfs.block_size:
+            raise DirectoryIndexError("directory smaller than one block")
+
+        session = _DirectoryIndexSession(self)
+        target = name.encode("utf-8", "surrogateescape")
+        target_hash = xfs_da_hash(target)
+
+        candidate = session.lookup(target_hash)
+        if candidate is None:
+            # No live leaf entry for this hash. Verify the index answer with a
+            # full scan so a stale/corrupt index cannot cause a false negative.
+            self.xfs.lookup_stats["index_miss"] += 1
+            return self._verify_miss(name)
+
+        inode_num, entry_name, filetype = candidate
+        if entry_name != target:
+            # Hash collision with a differently named entry. The leaf may hold
+            # more colliding entries, but rather than trust its completeness we
+            # let the linear scan make the authoritative decision.
+            log.debug("Hash collision in directory %r for name %r, verifying with linear scan", self, name)
+            self.xfs.lookup_stats["index_fallback"] += 1
+            return self._linear_lookup(name)
+
+        self.xfs.lookup_stats["index_hit"] += 1
+        return self.xfs.get_inode(inode_num, name, filetype)
+
+    def _verify_miss(self, name: str) -> INode | None:
+        self.xfs.lookup_stats["linear"] += 1
+        for entry in self.iterdir():
+            if entry.filename == name:
+                log.warning("Directory index missed existing entry %r in %r", name, self)
+                self.xfs.lookup_stats["index_fallback"] += 1
+                return entry
+        return None
+
     def iterdir(self) -> Iterator[INode]:
         if self.filetype != stat.S_IFDIR:
             raise NotADirectoryError(f"{self!r} is not a directory")
@@ -434,8 +526,9 @@ class INode:
 
                         entry = data_entry(block)
 
-                        # Entries are 8 byte aligned
-                        # uint64 inum | uint8 namelen | variable name | uint8 ftype | uint16 tag
+                        # Records start on an 8 byte boundary. cstruct has just
+                        # consumed through the 2 byte tag, so advance from the
+                        # cursor to the next boundary (no-op when already there).
                         misalign = block.tell() % 8
                         if misalign:
                             block.seek(8 - misalign, io.SEEK_CUR)
@@ -529,6 +622,288 @@ class INode:
             raise UnsupportedDataforkException(f"{self!r} is a character/block device.")
         dinode_type = c_xfs.xfs_dinode_fmt(self.inode.di_format)
         raise UnsupportedDataforkException(f"{self!r} is an unsupported datafork: {dinode_type}")
+
+
+class _DirectoryIndexSession:
+    """One hash-indexed name lookup against a block-format directory.
+
+    A session caches the logical directory blocks it reads (de-duplicating
+    repeated access) and counts those reads, so callers can demonstrate that a
+    targeted lookup touches far fewer blocks than a full traversal.
+    """
+
+    LEAF_MAGICS = (
+        c_xfs.XFS_DIR2_LEAF1_MAGIC,
+        c_xfs.XFS_DIR2_LEAFN_MAGIC,
+        c_xfs.XFS_DIR3_LEAF1_MAGIC,
+        c_xfs.XFS_DIR3_LEAFN_MAGIC,
+    )
+    NODE_MAGICS = (c_xfs.XFS_DIR2_NODE_MAGIC, c_xfs.XFS_DIR3_NODE_MAGIC)
+
+    def __init__(self, inode: INode):
+        self.inode = inode
+        self.xfs = inode.xfs
+        self.block_size = self.xfs.block_size
+        self.block_count = inode.size // self.block_size
+        if self.block_count == 0:
+            raise DirectoryIndexError("directory has no data blocks")
+
+        self._cache: dict[int, bytes] = {}
+        # Number of logical directory blocks pulled from the underlying stream.
+        self.blocks_read = 0
+
+    def lookup(self, target_hash: int) -> tuple[int, bytes, int | None] | None:
+        leaf_block, embedded = self._find_leaf_block(target_hash)
+        entries = self._read_embedded_leaf() if embedded else self._read_leaf_entries(leaf_block)
+
+        match = self._binary_search(entries, target_hash)
+        if match is None:
+            return None
+
+        hashval, address = match
+        if address == 0:
+            raise DirectoryIndexError(f"leaf entry for hash 0x{hashval:x} is stale (address == 0)")
+        return self._read_data_entry(address)
+
+    def _find_leaf_block(self, target_hash: int) -> tuple[int, bool]:
+        """Return (logical block number, embedded-in-data-block)."""
+        first = self._read_block(0)
+        magic = struct.unpack(">I", first[:4])[0]
+
+        if magic in (c_xfs.XFS_DIR2_BLOCK_MAGIC, c_xfs.XFS_DIR3_BLOCK_MAGIC):
+            # Single-block directory: the leaf tail lives inside the data block.
+            return 0, True
+        if magic not in (c_xfs.XFS_DIR2_DATA_MAGIC, c_xfs.XFS_DIR3_DATA_MAGIC):
+            raise DirectoryIndexError(f"unexpected magic 0x{magic:x} in first directory block")
+
+        # Multiblock directory. The last logical block is either the freeindex
+        # block (leaf format) or a leaf/node block, which tells us how the index
+        # metadata is laid out.
+        last_block = self.block_count - 1
+        last = self._read_block(last_block)
+        last_magic16 = struct.unpack(">H", last[:2])[0]
+        last_magic32 = struct.unpack(">I", last[:4])[0]
+
+        if last_magic32 in (c_xfs.XFS_DIR2_FREE_MAGIC, c_xfs.XFS_DIR3_FREE_MAGIC):
+            # The free hdr follows the data block header (16 bytes in v2,
+            # 64 bytes for the CRC-enabled v3 header).
+            free_hdr_off = c_xfs.xfs_dir3_data_hdr.size if last_magic32 == c_xfs.XFS_DIR3_FREE_MAGIC else 16
+            free = c_xfs.xfs_dir2_free_hdr(io.BytesIO(last[free_hdr_off:]))
+            # firstdb is the first block beyond the data region, i.e. the leaf.
+            leaf_block = free.firstdb
+            if not 0 < leaf_block < last_block:
+                raise DirectoryIndexError(f"free block points at invalid leaf block {leaf_block}")
+        elif last_magic16 in self.LEAF_MAGICS or last_magic32 in self.LEAF_MAGICS:
+            # No separate free block: the last block is the leaf (or node root).
+            leaf_block = last_block
+        else:
+            raise DirectoryIndexError(f"unexpected magic 0x{last_magic32:x} in last directory block")
+
+        leaf = self._read_block(leaf_block)
+        leaf_magic16 = struct.unpack(">H", leaf[:2])[0]
+        leaf_magic32 = struct.unpack(">I", leaf[:4])[0]
+        if leaf_magic32 in self.NODE_MAGICS or leaf_magic16 == c_xfs.XFS_DIR2_NODE_MAGIC:
+            return self._descend_node_btree(leaf_block, target_hash), False
+
+        # In node format the node root sits one block above the first leaf.
+        node_block = leaf_block + 1
+        if node_block < last_block:
+            candidate = self._read_block(node_block)
+            candidate_magic16 = struct.unpack(">H", candidate[:2])[0]
+            candidate_magic32 = struct.unpack(">I", candidate[:4])[0]
+            if candidate_magic32 in self.NODE_MAGICS or candidate_magic16 == c_xfs.XFS_DIR2_NODE_MAGIC:
+                return self._descend_node_btree(node_block, target_hash), False
+            if candidate_magic32 in self.LEAF_MAGICS or candidate_magic16 in (
+                c_xfs.XFS_DIR2_LEAF1_MAGIC,
+                c_xfs.XFS_DIR2_LEAFN_MAGIC,
+            ):
+                # A second leaf without a node root is valid for leaf format.
+                leaf_block = node_block
+                leaf_magic16, leaf_magic32 = candidate_magic16, candidate_magic32
+            else:
+                raise DirectoryIndexError(
+                    f"expected node root in block {node_block}, found magic 0x{candidate_magic32:x}"
+                )
+
+        if leaf_magic32 in self.LEAF_MAGICS or leaf_magic16 in (
+            c_xfs.XFS_DIR2_LEAF1_MAGIC,
+            c_xfs.XFS_DIR2_LEAFN_MAGIC,
+        ):
+            return leaf_block, False
+        raise DirectoryIndexError(f"block {leaf_block} is neither a leaf nor a node (magic 0x{leaf_magic32:x})")
+
+    def _descend_node_btree(self, root_block: int, target_hash: int) -> int:
+        block_num = root_block
+        visited: set[int] = set()
+        while True:
+            if block_num in visited or not 0 < block_num < self.block_count:
+                raise DirectoryIndexError(f"cycle or out-of-range node block {block_num}")
+            visited.add(block_num)
+
+            block = self._read_block(block_num)
+            header, header_size = self._parse_node_header(block)
+            if header.count == 0:
+                raise DirectoryIndexError(f"node block {block_num} has no records")
+
+            entries_start = header_size
+            entries = [
+                struct.unpack(">II", block[entries_start + i * 8 : entries_start + (i + 1) * 8])
+                for i in range(header.count)
+            ]
+            if entries[-1][0] < target_hash:
+                raise DirectoryIndexError(
+                    f"target hash 0x{target_hash:x} exceeds node range ending at 0x{entries[-1][0]:x}"
+                )
+
+            child = None
+            for hashval, before in entries:
+                if hashval >= target_hash:
+                    child = before
+                    break
+            if child is None or not 0 < child < self.block_count:
+                raise DirectoryIndexError(f"node entry points at invalid block {child}")
+
+            child_block = self._read_block(child)
+            child_magic16 = struct.unpack(">H", child_block[:2])[0]
+            child_magic32 = struct.unpack(">I", child_block[:4])[0]
+            if child_magic32 in self.NODE_MAGICS or child_magic16 == c_xfs.XFS_DIR2_NODE_MAGIC:
+                block_num = child
+                continue
+            if child_magic32 in self.LEAF_MAGICS or child_magic16 in (
+                c_xfs.XFS_DIR2_LEAF1_MAGIC,
+                c_xfs.XFS_DIR2_LEAFN_MAGIC,
+            ):
+                return child
+            raise DirectoryIndexError(f"node child {child} has unexpected magic 0x{child_magic32:x}")
+
+    def _parse_node_header(self, block: bytes) -> tuple[object, int]:
+        magic32 = struct.unpack(">I", block[:4])[0]
+        if magic32 == c_xfs.XFS_DIR3_NODE_MAGIC:
+            header = c_xfs.xfs_da3_node_hdr(io.BytesIO(block))
+            return header, c_xfs.xfs_da3_node_hdr.size
+        magic16 = struct.unpack(">H", block[:2])[0]
+        if magic16 == c_xfs.XFS_DIR2_NODE_MAGIC:
+            header = c_xfs.xfs_da_node_hdr(io.BytesIO(block))
+            return header, c_xfs.xfs_da_node_hdr.size
+        raise DirectoryIndexError(f"invalid node magic 0x{magic32:x}")
+
+    def _read_embedded_leaf(self) -> list[tuple[int, int]]:
+        block = self._read_block(0)
+        tail = c_xfs.xfs_dir2_block_tail(io.BytesIO(block[len(block) - len(c_xfs.xfs_dir2_block_tail) :]))
+        if tail.count == 0:
+            raise DirectoryIndexError("single-block directory leaf tail reports zero entries")
+        entries_end = len(block) - len(c_xfs.xfs_dir2_block_tail)
+        entries_start = entries_end - tail.count * len(c_xfs.xfs_dir2_leaf_entry)
+        header_size = c_xfs.xfs_dir3_data_hdr.size if self.xfs._has_crc else c_xfs.xfs_dir2_data_hdr.size
+        if entries_start < header_size:
+            raise DirectoryIndexError("leaf entries overlap the data block header")
+        return [
+            struct.unpack(">II", block[entries_start + i * 8 : entries_start + (i + 1) * 8]) for i in range(tail.count)
+        ]
+
+    def _read_leaf_entries(self, block_num: int) -> list[tuple[int, int]]:
+        block = self._read_block(block_num)
+        magic32 = struct.unpack(">I", block[:4])[0]
+        if magic32 in (c_xfs.XFS_DIR3_LEAF1_MAGIC, c_xfs.XFS_DIR3_LEAFN_MAGIC):
+            header_size = c_xfs.xfs_dir3_leaf_hdr.size
+            count = c_xfs.xfs_dir3_leaf_hdr(io.BytesIO(block)).count
+        else:
+            magic16 = struct.unpack(">H", block[:2])[0]
+            if magic16 not in (c_xfs.XFS_DIR2_LEAF1_MAGIC, c_xfs.XFS_DIR2_LEAFN_MAGIC):
+                raise DirectoryIndexError(f"invalid leaf magic 0x{magic32:x} in block {block_num}")
+            header_size = c_xfs.xfs_dir2_leaf_hdr.size
+            count = c_xfs.xfs_dir2_leaf_hdr(io.BytesIO(block)).count
+
+        if count == 0:
+            raise DirectoryIndexError(f"leaf block {block_num} reports zero entries")
+        entries_end = header_size + count * len(c_xfs.xfs_dir2_leaf_entry)
+        if entries_end > len(block):
+            raise DirectoryIndexError(f"leaf entries in block {block_num} overflow the block")
+        return [struct.unpack(">II", block[header_size + i * 8 : header_size + (i + 1) * 8]) for i in range(count)]
+
+    def _binary_search(self, entries: list[tuple[int, int]], target_hash: int) -> tuple[int, int] | None:
+        # Leaf entries are sorted by hashval on disk. Find the first entry whose
+        # hash is >= the target (lower bound).
+        lo, hi = 0, len(entries)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if entries[mid][0] < target_hash:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo >= len(entries) or entries[lo][0] != target_hash:
+            return None
+        return entries[lo]
+
+    def _read_data_entry(self, address: int) -> tuple[int, bytes, int | None]:
+        # With sb_dirblklog == 0 a data pointer encodes (logical block, offset).
+        block_num, offset = divmod(address, self.block_size)
+        if block_num >= self.block_count or offset >= self.block_size:
+            raise DirectoryIndexError(f"leaf address 0x{address:x} points outside the directory")
+
+        block = self._read_block(block_num)
+        magic32 = struct.unpack(">I", block[:4])[0]
+        if magic32 not in (
+            c_xfs.XFS_DIR2_DATA_MAGIC,
+            c_xfs.XFS_DIR3_DATA_MAGIC,
+            c_xfs.XFS_DIR2_BLOCK_MAGIC,
+            c_xfs.XFS_DIR3_BLOCK_MAGIC,
+        ):
+            raise DirectoryIndexError(f"data block {block_num} has unexpected magic 0x{magic32:x}")
+
+        entry_stream = io.BytesIO(block)
+        entry_stream.seek(offset)
+        try:
+            if self.xfs._has_ftype:
+                entry = c_xfs.xfs_dir2_data_entry_ftype(entry_stream)
+                filetype = FILETYPES[entry.ftype]
+            else:
+                entry = c_xfs.xfs_dir2_data_entry(entry_stream)
+                filetype = None
+            name = entry.name
+        except EOFError as err:
+            raise DirectoryIndexError(f"unable to parse data entry at 0x{address:x}: {err}")
+
+        if not name or len(name) != entry.namelen or entry.namelen > 255:
+            raise DirectoryIndexError(f"data entry at 0x{address:x} has invalid name length")
+        if entry.inumber >> 48 == 0xFFFF:
+            raise DirectoryIndexError(f"leaf address 0x{address:x} points at a free (unused) record")
+        return entry.inumber, name, filetype
+
+    def _read_block(self, block_num: int) -> bytes:
+        if block_num not in self._cache:
+            if not 0 <= block_num < self.block_count:
+                raise DirectoryIndexError(f"logical block {block_num} out of range (0..{self.block_count - 1})")
+            # Open a fresh stream per block so the dissect aligned read buffer
+            # cannot pull neighbouring blocks into this lookup's read accounting.
+            stream = self.inode.open()
+            stream.seek(block_num * self.block_size)
+            data = stream.read(self.block_size)
+            if len(data) != self.block_size:
+                raise DirectoryIndexError(f"short read of directory block {block_num} ({len(data)} bytes)")
+            self._cache[block_num] = data
+            self.blocks_read += 1
+        return self._cache[block_num]
+
+
+def xfs_da_hash(name: bytes) -> int:
+    """Compute the XFS directory hash (xfs_da_hashname) of raw name bytes.
+
+    Mirrors the kernel implementation, which prefixes the name with its 32 bit
+    big endian length and folds the bytes together with a rotate-right-xor.
+    """
+    return _xfs_da_roll_hash(0, struct.pack(">I", len(name)) + name)
+
+
+def _xfs_da_roll_hash(hashval: int, data: bytes) -> int:
+    # Equivalent to the kernel's xfs_da_roll_hash / xfs_da_rotr. The rotate
+    # count is the byte value masked to 5 bits. Python's shifts stay defined
+    # where the C version relies on the mask keeping the count below 32.
+    for byte in data:
+        count = byte & 31
+        rotr = ((hashval >> count) | (hashval << (32 - count))) & 0xFFFFFFFF
+        hashval = rotr ^ byte
+    return hashval
 
 
 def parse_fsblock(s: bytes) -> tuple[int, int, int, int]:
