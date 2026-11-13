@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import datetime
+import io
 import stat
 from typing import BinaryIO
 
+import pytest
+
+from dissect.xfs.exceptions import SymlinkUnavailableException
 from dissect.xfs.xfs import XFS
+from tests.symlink_image import build_xfs_symlink_image
+
+PAYLOAD = 512 - 56
+SYMLINK_INODE = 44
+
+
+def make_fragments(target: bytes) -> list[tuple[int, bytes]]:
+    return [(offset, target[offset : offset + PAYLOAD]) for offset in range(0, len(target), PAYLOAD)]
+
+
+def read_link(image: bytes) -> str:
+    xfs = XFS(io.BytesIO(image))
+    return xfs.get_inode(SYMLINK_INODE).link
 
 
 def test_xfs(xfs_bin: BinaryIO) -> None:
@@ -72,3 +89,98 @@ def test_symlinks(xfs_symlink_bin: BinaryIO) -> None:
 
     xfs = XFS(xfs_symlink_bin)
     assert xfs.get(path).link == "../../../../other/path/source/to/my/file.ext"
+
+
+
+def test_symlink_fragmented_512_byte_blocks() -> None:
+    target = b"/very/long/" + b"a" * 500 + b"/" + b"b" * 300 + b"/target"
+    fragments = make_fragments(target)
+    assert len(fragments) == 2
+
+    assert read_link(build_xfs_symlink_image(fragments, owner=SYMLINK_INODE)) == target.decode()
+
+
+def test_symlink_fragmented_out_of_order() -> None:
+    target = b"/fragments/" + b"a" * 600 + b"/" + b"b" * 500 + b"/target"
+    fragments = make_fragments(target)
+    assert len(fragments) == 3
+
+    image = build_xfs_symlink_image(fragments, owner=SYMLINK_INODE, physical_order=[2, 0, 1])
+    assert read_link(image) == target.decode()
+
+
+def test_symlink_fragmented_missing_fragment() -> None:
+    target = b"/missing/" + b"a" * 600 + b"/" + b"b" * 300 + b"/target"
+    fragments = make_fragments(target)
+    del fragments[1]
+
+    xfs = XFS(io.BytesIO(build_xfs_symlink_image(fragments, owner=SYMLINK_INODE, size=len(target))))
+    node = xfs.get_inode(SYMLINK_INODE)
+
+    with pytest.raises(SymlinkUnavailableException) as exc_info:
+        node.link
+
+    error = exc_info.value
+    assert error.missing == [(PAYLOAD, 2 * PAYLOAD)]
+    assert "456-912" in str(error)
+    assert error.partial is not None
+    assert error.partial[:PAYLOAD] == target[:PAYLOAD]
+    assert error.partial[2 * PAYLOAD :] == target[2 * PAYLOAD :]
+
+
+def test_symlink_fragmented_duplicate_fragment() -> None:
+    target = b"/duplicate/" + b"a" * 600 + b"/" + b"b" * 300 + b"/target"
+    fragments = make_fragments(target)
+    fragments.append(fragments[1])
+
+    assert read_link(build_xfs_symlink_image(fragments, owner=SYMLINK_INODE)) == target.decode()
+
+
+def test_symlink_fragmented_duplicate_fragment_conflict() -> None:
+    target = b"/conflict/" + b"a" * 700 + b"/target"
+    fragments = make_fragments(target)
+    conflicting = bytearray(fragments[1][1])
+    conflicting[0] ^= 0xFF
+    fragments.append((PAYLOAD, bytes(conflicting)))
+
+    xfs = XFS(io.BytesIO(build_xfs_symlink_image(fragments, owner=SYMLINK_INODE)))
+    node = xfs.get_inode(SYMLINK_INODE)
+
+    with pytest.raises(SymlinkUnavailableException) as exc_info:
+        node.link
+
+    error = exc_info.value
+    assert error.duplicates == [PAYLOAD]
+    assert error.conflicts == [(PAYLOAD, PAYLOAD + 1)]
+    assert "456-457" in str(error)
+
+
+def test_symlink_fragmented_length_conflict() -> None:
+    target = b"/length/" + b"a" * 600 + b"/" + b"b" * 300 + b"/target"
+    fragments = make_fragments(target)
+    lengths = [len(data) for _, data in fragments]
+    lengths[1] += 100
+
+    xfs = XFS(io.BytesIO(build_xfs_symlink_image(fragments, owner=SYMLINK_INODE, lengths=lengths)))
+    node = xfs.get_inode(SYMLINK_INODE)
+
+    with pytest.raises(SymlinkUnavailableException, match="length conflict"):
+        node.link
+
+
+def test_symlink_fragmented_foreign_fragment() -> None:
+    target = b"/foreign/" + b"a" * 600 + b"/" + b"b" * 300 + b"/target"
+    fragments = make_fragments(target)
+    owners = [SYMLINK_INODE, SYMLINK_INODE + 1, SYMLINK_INODE]
+
+    xfs = XFS(io.BytesIO(build_xfs_symlink_image(fragments, owner=SYMLINK_INODE, owners=owners)))
+    node = xfs.get_inode(SYMLINK_INODE)
+
+    with pytest.raises(SymlinkUnavailableException) as exc_info:
+        node.link
+
+    error = exc_info.value
+    assert error.missing == [(PAYLOAD, 2 * PAYLOAD)]
+    assert error.ignored == [(PAYLOAD, len(fragments[1][1]), "owner")]
+    assert error.partial[:PAYLOAD] == target[:PAYLOAD]
+    assert error.partial[2 * PAYLOAD :] == target[2 * PAYLOAD :]

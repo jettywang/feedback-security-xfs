@@ -17,6 +17,7 @@ from dissect.xfs.exceptions import (
     FileNotFoundError,
     NotADirectoryError,
     NotASymlinkError,
+    SymlinkUnavailableException,
     UnsupportedDataforkException,
 )
 
@@ -300,26 +301,174 @@ class INode:
         if self.filetype != stat.S_IFLNK:
             raise NotASymlinkError(f"{self!r} is not a symlink")
 
-        if self.inode.di_format != c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_LOCAL and self.xfs.version == 5:
-            # Almost always, symlinks (max size of 1024) fit within a block. If the block size if 512, we might
-            # need three blocks. These three blocks could theoretially be distributed over multiple extents.
-            # Linux kernel handles this by using sl_offset to piece the symlink back together.
-            # As this edge case of an edge case is very unlikely, it is unsupported until we observe it.
-            # Ticket: https://github.com/fox-it/dissect.xfs/issues/36
-            if len(self.dataruns) > 1:
-                raise NotImplementedError(f"{self!r} has a symlink distributed over multiple extents")
+        if self.inode.di_format == c_xfs.xfs_dinode_fmt.XFS_DINODE_FMT_LOCAL or self.xfs.version != 5:
+            return self.open().read(self.size).decode(errors="surrogateescape")
 
-            # We do not use open because for non-resident symlinks self.size does not include the symlink header
-            symlink_size = len(c_xfs.xfs_dsymlink_hdr) + self.size
-            fh = RunlistStream(self.xfs.fh, self.dataruns, symlink_size, self.xfs.block_size)
+        return self._read_remote_symlink()
 
-            header = c_xfs.xfs_dsymlink_hdr(fh)
-            if header.sl_magic != c_xfs.XFS_SYMLINK_MAGIC:
+    def _read_remote_symlink(self) -> str:
+        size = self.size
+        if size == 0:
+            return ""
+
+        block_size = self.xfs.block_size
+        header_size = len(c_xfs.xfs_dsymlink_hdr)
+        payload_size = block_size - header_size
+        if payload_size <= 0:
+            raise Error(f"{self!r} has a block size too small for a remote symlink header")
+
+        accepted_uuids = {b"\x00" * 16, self.xfs.uuid.bytes, self.xfs.meta_uuid.bytes}
+
+        fragments = []
+        ignored = []
+        saw_magic = False
+
+        for _, block, count, flag in sorted(self._iter_blocks(), key=lambda record: record[0]):
+            for block_offset in range(count):
+                if flag:
+                    # Unwritten extents never contain symlink data
+                    continue
+
+                fsb = block + block_offset
+                data = self._read_fsb(fsb)
+                if len(data) < header_size:
+                    continue
+
+                header = c_xfs.xfs_dsymlink_hdr(io.BytesIO(data))
+                if header.sl_magic != c_xfs.XFS_SYMLINK_MAGIC:
+                    continue
+                saw_magic = True
+
+                # Only fragments that belong to this inode may be used. The owner and UUID guard against
+                # fragments copied from another inode or from another filesystem image.
+                if header.sl_owner != self.inum:
+                    ignored.append((header.sl_offset, header.sl_bytes, "owner"))
+                    continue
+                if bytes(header.sl_uuid) not in accepted_uuids:
+                    ignored.append((header.sl_offset, header.sl_bytes, "uuid"))
+                    continue
+
+                if header.sl_offset >= size:
+                    raise self._symlink_error(
+                        f"length conflict: fragment at logical offset {header.sl_offset} is beyond symlink "
+                        f"size {size}",
+                        missing=[],
+                        ignored=ignored,
+                    )
+
+                fragments.append((int(header.sl_offset), int(header.sl_bytes), data[header_size:]))
+
+        if not fragments:
+            if not saw_magic:
                 raise NotASymlinkError(f"{self!r} has invalid symlink magic")
+            raise self._symlink_error(
+                "no symlink fragments belong to this inode",
+                missing=[(0, size)],
+                ignored=ignored,
+            )
 
-            return fh.read(header.sl_bytes).decode(errors="surrogateescape")
+        fragment_lengths = self._fragment_lengths(fragments, size, payload_size, ignored)
+        fragments = [(offset, data[: length]) for (offset, _, data), length in zip(fragments, fragment_lengths)]
+        fragments.sort(key=lambda fragment: fragment[0])
 
-        return self.open().read().decode(errors="surrogateescape")
+        result = bytearray(size)
+        covered = bytearray(size)
+        conflicts = []
+        for offset, data in fragments:
+            for pos, byte in enumerate(data, start=offset):
+                if covered[pos]:
+                    if result[pos] != byte:
+                        conflicts.append((pos, pos + 1))
+                else:
+                    result[pos] = byte
+                    covered[pos] = 1
+
+        duplicates = _find_duplicate_offsets(fragments)
+
+        if conflicts:
+            ranges = _merge_ranges(conflicts)
+            raise self._symlink_error(
+                f"overlapping fragments with conflicting content at byte ranges (end exclusive): "
+                f"{_format_ranges(ranges)}",
+                missing=_find_missing(covered),
+                ignored=ignored,
+                partial=result,
+                duplicates=duplicates,
+                conflicts=ranges,
+            )
+
+        missing = _find_missing(covered)
+        if missing:
+            raise self._symlink_error(
+                f"missing byte ranges (end exclusive): {_format_ranges(missing)}",
+                missing=missing,
+                ignored=ignored,
+                partial=result,
+                duplicates=duplicates,
+            )
+
+        return bytes(result).decode(errors="surrogateescape")
+
+    def _fragment_lengths(
+        self,
+        fragments: list[tuple[int, int, bytes]],
+        size: int,
+        payload_size: int,
+        ignored: list[tuple[int, int, str]],
+    ) -> list[int]:
+        """Validate and return the payload length of every fragment.
+
+        The XFS on-disk format stores the total symlink length in ``sl_bytes`` on every block, while the payload
+        length follows from the block size and ``sl_offset``. Some writers store the per-fragment length instead;
+        accept that convention too, but reject a mix or any impossible length as a length conflict.
+        """
+        geometric = [min(payload_size, max(size - offset, 0)) for offset, _, _ in fragments]
+
+        if all(length == size for _, length, _ in fragments):
+            # All headers repeat the total symlink length instead of the fragment length
+            return geometric
+
+        if all(length == geometric[i] for i, (_, length, _) in enumerate(fragments)):
+            return geometric
+
+        values = sorted({length for _, length, _ in fragments})
+        raise self._symlink_error(
+            f"length conflict: fragment headers disagree about the symlink length (sl_bytes values: "
+            f"{', '.join(str(value) for value in values)}; inode size: {size})",
+            missing=[],
+            ignored=ignored,
+        )
+
+    def _read_fsb(self, fsb: int) -> bytes:
+        agnum, blknum = fsb_to_bb(fsb, self.ag.sb.sb_agblklog)
+        block = agnum * self.xfs.sb.sb_agblocks + blknum
+        self.xfs.fh.seek(block * self.xfs.block_size)
+        return self.xfs.fh.read(self.xfs.block_size)
+
+    def _symlink_error(
+        self,
+        reason: str,
+        missing: list[tuple[int, int]],
+        ignored: list[tuple[int, int, str]] | None = None,
+        partial: bytearray | None = None,
+        duplicates: list[int] | None = None,
+        conflicts: list[tuple[int, int]] | None = None,
+    ) -> SymlinkUnavailableException:
+        message = f"{self!r} has an incomplete symlink: {reason}"
+        if ignored:
+            details = ", ".join(f"offset {offset}, {length} bytes ({why})" for offset, length, why in ignored)
+            message += f"; ignored fragments that do not belong to this inode: {details}"
+        if duplicates:
+            message += f"; duplicate fragments at logical offsets: {', '.join(str(offset) for offset in duplicates)}"
+
+        error = SymlinkUnavailableException(message)
+        error.size = self.size
+        error.missing = missing
+        error.ignored = ignored or []
+        error.duplicates = duplicates or []
+        error.conflicts = conflicts or []
+        error.partial = bytes(partial) if partial is not None else None
+        return error
 
     @property
     def atime(self) -> datetime:
@@ -551,6 +700,46 @@ def fsb_to_bb(block: int, agblklog: int) -> tuple[int, int]:
     agnum = block >> agblklog
     blknum = block & ((1 << agblklog) - 1)
     return agnum, blknum
+
+
+def _find_missing(covered: bytearray) -> list[tuple[int, int]]:
+    missing = []
+    start = None
+    for offset, value in enumerate(covered):
+        if not value and start is None:
+            start = offset
+        elif value and start is not None:
+            missing.append((start, offset))
+            start = None
+    if start is not None:
+        missing.append((start, len(covered)))
+    return missing
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _find_duplicate_offsets(fragments: list[tuple[int, bytes]]) -> list[int]:
+    seen = set()
+    duplicates = set()
+    for offset, _ in fragments:
+        if offset in seen:
+            duplicates.add(offset)
+        seen.add(offset)
+    return sorted(duplicates)
+
+
+def _format_ranges(ranges: list[tuple[int, int]]) -> str:
+    return ", ".join(f"{start}-{end}" for start, end in ranges)
 
 
 def _parse_ts(ts: int, is_bigtime: bool) -> int:
