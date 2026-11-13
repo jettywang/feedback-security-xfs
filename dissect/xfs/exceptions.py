@@ -9,6 +9,14 @@ class UnsupportedDataforkException(Error):
     pass
 
 
+class BTreeCycleError(Error):
+    """Raised when a B+Tree node references a block already visited on its walk path."""
+
+
+class InvalidBlockAddressError(Error):
+    """Raised when a B+Tree pointer does not translate to a valid filesystem block."""
+
+
 class FileNotFoundError(Error, FileNotFoundError):
     pass
 

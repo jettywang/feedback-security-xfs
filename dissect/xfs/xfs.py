@@ -13,8 +13,10 @@ from dissect.util.stream import RangeStream, RunlistStream
 
 from dissect.xfs.c_xfs import FILETYPES, c_xfs
 from dissect.xfs.exceptions import (
+    BTreeCycleError,
     Error,
     FileNotFoundError,
+    InvalidBlockAddressError,
     NotADirectoryError,
     NotASymlinkError,
     UnsupportedDataforkException,
@@ -24,8 +26,17 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from datetime import datetime
 
+    SmallBtreeNode = c_xfs.xfs_btree_sblock | c_xfs.xfs_btree_sblock_crc
+    LargeBtreeNode = c_xfs.xfs_btree_lblock | c_xfs.xfs_btree_lblock_crc
+    BtreeNode = SmallBtreeNode | LargeBtreeNode
+
 log = logging.getLogger(__name__)
 log.setLevel(os.getenv("DISSECT_LOG_XFS", "CRITICAL"))
+
+# B+Tree height is bounded by the on-disk block count; real XFS trees are only a handful of levels
+# deep. This defensive cap stops a malformed, non-repeating chain before it can exhaust the
+# interpreter stack, while remaining far above any legitimate tree height.
+BTREE_MAX_DEPTH = 50
 
 
 class XFS:
@@ -102,19 +113,46 @@ class XFS:
             yield parse_fsblock(record)
 
     def walk_large_tree(self, block: int, leaf_size: int, magic: list[int] | None = None) -> Iterator[bytes]:
-        self.fh.seek(block * self.block_size)
-        root = self._lblock_s(self.fh)
+        if block >= self.sb.sb_dblocks:
+            raise InvalidBlockAddressError(
+                f"B+Tree root block {block} is outside the filesystem ({self.sb.sb_dblocks} blocks)"
+            )
 
-        yield from self._walk_large_tree(root, leaf_size, magic)
+        self.fh.seek(block * self.block_size)
+        root = self._read_btree_block(self._lblock_s)
+
+        yield from self._walk_large_tree(root, leaf_size, magic, frozenset({block}), 1)
 
     def walk_small_tree(
         self, block: int, agnum: int, leaf_size: int, magic: list[int] | None = None
     ) -> Iterator[bytes]:
+        if agnum >= self.sb.sb_agcount:
+            raise InvalidBlockAddressError(f"B+Tree allocation group {agnum} does not exist")
+        if block >= self.sb.sb_agblocks:
+            raise InvalidBlockAddressError(
+                f"Small B+Tree root block {block} escapes allocation group {agnum} "
+                f"(size {self.sb.sb_agblocks} blocks)"
+            )
+
         block = agnum * self.sb.sb_agblocks + block
         self.fh.seek(block * self.block_size)
-        root = self._sblock_s(self.fh)
+        root = self._read_btree_block(self._sblock_s)
 
-        yield from self._walk_small_tree(root, leaf_size, agnum, magic)
+        yield from self._walk_small_tree(root, leaf_size, agnum, magic, frozenset({block}), 1)
+
+    def _read_btree_block(self, structure: type) -> BtreeNode:
+        header_size = len(structure)
+        buf = self.fh.read(header_size)
+        if len(buf) != header_size:
+            raise Error(f"Short read for B+Tree node header at block offset {self.fh.tell() - len(buf)}")
+        return structure(io.BytesIO(buf))
+
+    def _read_btree_records(self, node: BtreeNode, leaf_size: int) -> bytes:
+        expected = node.bb_numrecs * leaf_size
+        buf = self.fh.read(expected)
+        if len(buf) != expected:
+            raise Error(f"Short read for {node.bb_numrecs} B+Tree leaf records (expected {expected}, got {len(buf)})")
+        return buf
 
     def _walk_small_tree(
         self,
@@ -122,53 +160,105 @@ class XFS:
         leaf_size: int,
         agnum: int,
         magic: list[int] | None = None,
+        visited: frozenset[int] = frozenset(),
+        depth: int = 1,
     ) -> Iterator[bytes]:
         fh = self.fh
-        if magic and node.bb_magic not in magic:
-            magic_values = ", ".join([f"0x{magic_value:x}" for magic_value in magic])
-            raise Error(f"B+Tree node has invalid magic. Expected one of ({magic_values}), got 0x{node.bb_magic:x}")
+        self._validate_btree_node(node, magic)
+
+        maxrecs = (self.block_size - len(self._sblock_s)) // 8
+        if node.bb_numrecs > maxrecs:
+            raise Error(f"B+Tree node claims {node.bb_numrecs} records but the block holds at most {maxrecs}")
 
         if node.bb_level == 0:
-            buf = fh.read(node.bb_numrecs * leaf_size)
+            buf = self._read_btree_records(node, leaf_size)
             for rec_num in range(node.bb_numrecs):
                 yield buf[rec_num * leaf_size : (rec_num + 1) * leaf_size]
         else:
+            if depth >= BTREE_MAX_DEPTH:
+                raise BTreeCycleError(f"B+Tree exceeded the maximum depth of {BTREE_MAX_DEPTH}")
+
             # Pointers start around halfway, we should already be at offset len(struct)
-            maxrecs = (self.block_size - len(self._sblock_s)) // 8
             fh.seek(maxrecs * 4, io.SEEK_CUR)
             ptrs = c_xfs.uint32[node.bb_numrecs](fh)
             for ptr in ptrs:
-                block = agnum * self.sb.sb_agblocks + ptr
-                fh.seek(block * self.block_size)
+                # Short form (per-AG) btrees may only reference blocks inside their own allocation group.
+                if ptr >= self.sb.sb_agblocks:
+                    raise InvalidBlockAddressError(
+                        f"Small B+Tree pointer {ptr} escapes allocation group {agnum} "
+                        f"(size {self.sb.sb_agblocks} blocks)"
+                    )
 
-                yield from self._walk_small_tree(self._sblock_s(fh), leaf_size, agnum, magic)
+                block = agnum * self.sb.sb_agblocks + ptr
+                if block in visited:
+                    raise BTreeCycleError(f"Small B+Tree points back to already visited block {block}")
+
+                fh.seek(block * self.block_size)
+                child = self._read_btree_block(self._sblock_s)
+
+                yield from self._walk_small_tree(child, leaf_size, agnum, magic, visited | {block}, depth + 1)
 
     def _walk_large_tree(
         self,
         node: c_xfs.xfs_btree_lblock | c_xfs.xfs_btree_lblock_crc,
         leaf_size: int,
         magic: list[int] | None = None,
+        visited: frozenset[int] = frozenset(),
+        depth: int = 1,
     ) -> Iterator[bytes]:
         fh = self.fh
+        self._validate_btree_node(node, magic)
+
+        maxrecs = (self.block_size - len(self._lblock_s)) // 16
+        if node.bb_numrecs > maxrecs:
+            raise Error(f"B+Tree node claims {node.bb_numrecs} records but the block holds at most {maxrecs}")
+
+        if node.bb_level == 0:
+            buf = self._read_btree_records(node, leaf_size)
+            for rec_num in range(node.bb_numrecs):
+                yield buf[rec_num * leaf_size : (rec_num + 1) * leaf_size]
+        else:
+            if depth >= BTREE_MAX_DEPTH:
+                raise BTreeCycleError(f"B+Tree exceeded the maximum depth of {BTREE_MAX_DEPTH}")
+
+            # Pointers start around halfway, we should already be at offset len(struct)
+            fh.seek(maxrecs * 8, io.SEEK_CUR)
+            ptrs = c_xfs.uint64[node.bb_numrecs](fh)
+            for ptr in ptrs:
+                # Long form btrees use filesystem-wide (agno|agbno) addresses; pointing into another
+                # allocation group is legal, but the encoded group/block must exist.
+                block = self._fsblock_to_block(ptr)
+                if block in visited:
+                    raise BTreeCycleError(f"Large B+Tree points back to already visited block {block}")
+
+                fh.seek(block * self.block_size)
+                child = self._read_btree_block(self._lblock_s)
+
+                yield from self._walk_large_tree(child, leaf_size, magic, visited | {block}, depth + 1)
+
+    def _validate_btree_node(self, node: BtreeNode, magic: list[int] | None) -> None:
         if magic and node.bb_magic not in magic:
             magic_values = ", ".join([f"0x{magic_value:x}" for magic_value in magic])
             raise Error(f"B+Tree node has invalid magic. Expected one of ({magic_values}), got 0x{node.bb_magic:x}")
 
-        if node.bb_level == 0:
-            buf = fh.read(node.bb_numrecs * leaf_size)
-            for rec_num in range(node.bb_numrecs):
-                yield buf[rec_num * leaf_size : (rec_num + 1) * leaf_size]
-        else:
-            # Pointers start around halfway, we should already be at offset len(struct)
-            maxrecs = (self.block_size - len(self._lblock_s)) // 16
-            fh.seek(maxrecs * 8, io.SEEK_CUR)
-            ptrs = c_xfs.uint64[node.bb_numrecs](fh)
-            for ptr in ptrs:
-                agnum, blknum = fsb_to_bb(ptr, self.sb.sb_agblklog)
-                block = agnum * self.sb.sb_agblocks + blknum
-                fh.seek(block * self.block_size)
+    def _fsblock_to_block(self, fsblock: int) -> int:
+        agnum, blknum = fsb_to_bb(fsblock, self.sb.sb_agblklog)
+        if agnum >= self.sb.sb_agcount:
+            raise InvalidBlockAddressError(
+                f"B+Tree pointer references allocation group {agnum}, but only {self.sb.sb_agcount} exist"
+            )
+        if blknum >= self.sb.sb_agblocks:
+            raise InvalidBlockAddressError(
+                f"B+Tree pointer references block {blknum} inside allocation group {agnum}, "
+                f"but the group is only {self.sb.sb_agblocks} blocks"
+            )
 
-                yield from self._walk_large_tree(self._lblock_s(fh), leaf_size, magic)
+        block = agnum * self.sb.sb_agblocks + blknum
+        if block >= self.sb.sb_dblocks:
+            raise InvalidBlockAddressError(
+                f"B+Tree pointer resolves to block {block} outside the filesystem ({self.sb.sb_dblocks} blocks)"
+            )
+        return block
 
 
 class AllocationGroup:
@@ -213,8 +303,7 @@ class AllocationGroup:
         return INode(self, inum, filename, filetype)
 
     def walk_extents(self, fsb: int) -> Iterator[tuple[int, int, int, int]]:
-        agnum, blknum = fsb_to_bb(fsb, self.sb.sb_agblklog)
-        block = agnum * self.xfs.sb.sb_agblocks + blknum
+        block = self.xfs._fsblock_to_block(fsb)
         yield from self.xfs.walk_extents(block)
 
     def walk_agi(self) -> Iterator[c_xfs.xfs_inobt_rec]:
@@ -511,6 +600,10 @@ class INode:
 
             # Pointers start around halfway
             maxrecs = (df.size - 4) // 16
+            if root.bb_numrecs > maxrecs:
+                raise Error(
+                    f"Inode B+Tree root claims {root.bb_numrecs} pointers but the data fork holds at most {maxrecs}"
+                )
             df.seek(4 + maxrecs * 8)
             ptrs = c_xfs.uint64[root.bb_numrecs](df)
 
